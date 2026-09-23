@@ -1,0 +1,1 @@
+<resources><style name="Theme.LocalAuth" parent="android:style/Theme.Material.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#7657FF</item><item name="android:navigationBarColor">#090D1D</item><item name="android:statusBarColor">#090D1D</item><item name="android:windowLightStatusBar">false</item></style></resources>
