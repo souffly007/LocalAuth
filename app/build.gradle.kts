@@ -21,8 +21,8 @@ android {
         applicationId = "fr.bonobo.localauth"
         minSdk = 28
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.1.0-beta1"
+        versionCode = 10
+        versionName = "1.1.0-beta3"
     }
     buildFeatures { compose = true; buildConfig = true }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }

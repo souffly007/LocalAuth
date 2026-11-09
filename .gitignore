@@ -3,4 +3,7 @@
 /app/build/
 /app/build/intermediates/javac/debug/compileDebugJavaWithJavac/classes/
 /app/build/intermediates/javac/debugAndroidTest/compileDebugAndroidTestJavaWithJavac/classes/
-/build/
+/build/*.apk
+*.aab
+*.jks
+*.keystore

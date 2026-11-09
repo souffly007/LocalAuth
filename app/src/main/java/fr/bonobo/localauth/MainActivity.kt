@@ -54,16 +54,33 @@ import fr.bonobo.localauth.security.AppLockManager
 class MainActivity : FragmentActivity() {
     private val vm by viewModels<MainViewModel>()
     private val unlocked = mutableStateOf(false)
+    private var trustedExternalFlow = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         enableEdgeToEdge()
         val lock = AppLockManager(this)
-        setContent { LocalAuthTheme { if (unlocked.value) Home(vm) else LockScreen(this, lock) { unlocked.value = true } } }
+        setContent {
+            LocalAuthTheme {
+                if (unlocked.value) {
+                    Home(
+                        vm = vm,
+                        onExternalFlowStarted = { trustedExternalFlow = true },
+                        onExternalFlowFinished = { trustedExternalFlow = false }
+                    )
+                } else {
+                    LockScreen(this, lock) { unlocked.value = true }
+                }
+            }
+        }
     }
+
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) unlocked.value = false
+        // Le scanner QR et le sélecteur de fichiers ouvrent une Activity externe.
+        // Ne pas reverrouiller LocalAuth pendant ces opérations de confiance.
+        if (!isChangingConfigurations && !trustedExternalFlow) unlocked.value = false
     }
 }
 
@@ -110,7 +127,7 @@ private fun showBiometric(activity: FragmentActivity, onSuccess: () -> Unit, onE
     prompt.authenticate(BiometricPrompt.PromptInfo.Builder().setTitle("Déverrouiller LocalAuth").setSubtitle("Confirmez votre empreinte digitale").setNegativeButtonText("Utiliser le code PIN").setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.BIOMETRIC_WEAK).build())
 }
 
-@Composable private fun Home(vm: MainViewModel) {
+@Composable private fun Home(vm: MainViewModel, onExternalFlowStarted: () -> Unit, onExternalFlowFinished: () -> Unit) {
     val accounts by vm.accounts.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -122,16 +139,47 @@ private fun showBiometric(activity: FragmentActivity, onSuccess: () -> Unit, onE
     var exportPassword by remember { mutableStateOf<CharArray?>(null) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val createBackup = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        onExternalFlowFinished()
         val password = exportPassword
         if (uri != null && password != null) scope.launch {
-            runCatching { vm.exportBackup(password) }.onSuccess { bytes -> context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }; message = "Sauvegarde chiffrée créée" }.onFailure { message = "Erreur : ${it.message}" }
+            runCatching {
+                val bytes = vm.exportBackup(password)
+                require(bytes.isNotEmpty()) { "La sauvegarde générée est vide" }
+
+                val output = context.contentResolver.openOutputStream(uri, "wt")
+                    ?: error("Impossible d’ouvrir le fichier de sauvegarde en écriture")
+                output.use {
+                    it.write(bytes)
+                    it.flush()
+                }
+
+                val writtenBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error("Impossible de vérifier le fichier de sauvegarde")
+                require(writtenBytes.isNotEmpty()) { "Le fichier créé est vide" }
+                require(writtenBytes.contentEquals(bytes)) { "La vérification de la sauvegarde a échoué" }
+
+                writtenBytes.size
+            }.onSuccess { size ->
+                message = "Sauvegarde chiffrée créée et vérifiée (${size} octets)"
+            }.onFailure {
+                message = "Échec de la sauvegarde : ${it.message}"
+            }
             exportPassword = null
         }
     }
     val openBackup = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        onExternalFlowFinished()
         if (uri != null) runCatching { context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: error("Fichier illisible") }.onSuccess { pendingImport = it; showImportPassword = true }.onFailure { message = "Erreur : ${it.message}" }
     }
-    val scanner = rememberLauncherForActivityResult(ScanContract()) { result -> result.contents?.let { vm.importQr(it) { status -> message = status } } }
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        onExternalFlowFinished()
+        val contents = result.contents
+        if (contents.isNullOrBlank()) {
+            message = "Scan annulé ou QR code non reconnu"
+        } else {
+            vm.importQr(contents) { status -> message = status }
+        }
+    }
     LaunchedEffect(Unit) { while (true) { now = System.currentTimeMillis(); delay(1_000) } }
     Box(Modifier.fillMaxSize()) {
         Image(painter = painterResource(R.drawable.localauth_landscape), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
@@ -142,8 +190,17 @@ private fun showBiometric(activity: FragmentActivity, onSuccess: () -> Unit, onE
             Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Lock, null, tint = Violet, modifier = Modifier.size(38.dp)); Spacer(Modifier.width(10.dp)); Column { Row { Text("Local", color = Color.White, fontSize = 29.sp, fontWeight = FontWeight.Bold); Text("Auth", color = Color(0xFF20D9FF), fontSize = 29.sp, fontWeight = FontWeight.Bold) }; Text("by souffly007 • 100 % local", color = Color(0xFFAAB3D8)) } }
             Spacer(Modifier.height(14.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilledTonalButton(onClick = { scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Scannez un QR TOTP").setBeepEnabled(false)) }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Icon(Icons.Default.QrCodeScanner, null); Spacer(Modifier.width(4.dp)); Text("Scanner") }
-                FilledTonalButton(onClick = { openBackup.launch(arrayOf("application/json", "text/plain", "*/*")) }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Icon(Icons.Default.FileDownload, null); Spacer(Modifier.width(4.dp)); Text("Importer") }
+                FilledTonalButton(onClick = {
+                    onExternalFlowStarted()
+                    scanner.launch(
+                        ScanOptions()
+                            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("Scannez un QR TOTP")
+                            .setBeepEnabled(false)
+                            .setOrientationLocked(false)
+                    )
+                }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Icon(Icons.Default.QrCodeScanner, null); Spacer(Modifier.width(4.dp)); Text("Scanner") }
+                FilledTonalButton(onClick = { onExternalFlowStarted(); openBackup.launch(arrayOf("application/json", "text/plain", "*/*")) }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Icon(Icons.Default.FileDownload, null); Spacer(Modifier.width(4.dp)); Text("Importer") }
                 FilledTonalButton(onClick = { if (accounts.isEmpty()) message = "Aucun compte à sauvegarder" else showExportPassword = true }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Icon(Icons.Default.FileUpload, null); Spacer(Modifier.width(4.dp)); Text("Exporter") }
             }
             message?.let { Text(it, color = Color(0xFF69D9FF), fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)) }
@@ -158,7 +215,7 @@ private fun showBiometric(activity: FragmentActivity, onSuccess: () -> Unit, onE
         if (bytes != null) vm.importFile(bytes, password) { message = it }
     }
     if (showExportPassword) PasswordDialog("Protéger la sauvegarde", "Choisissez au moins 8 caractères. Ce mot de passe sera indispensable sur le nouveau téléphone.", true, onDismiss = { showExportPassword = false }) { password ->
-        showExportPassword = false; exportPassword = password; createBackup.launch("LocalAuth-backup.json")
+        showExportPassword = false; exportPassword = password; onExternalFlowStarted(); createBackup.launch("LocalAuth-backup.json")
     }
 }
 
